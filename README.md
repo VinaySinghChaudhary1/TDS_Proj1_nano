@@ -1,3 +1,12 @@
+---
+title: TDS Project 1 Deployer
+emoji: 🚀
+colorFrom: blue
+colorTo: indigo
+sdk: docker
+app_file: Dockerfile
+pinned: true
+---
 
 # 🚀 Final Upgraded Nano Project (GPT-4o)
 

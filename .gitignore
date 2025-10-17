@@ -1,0 +1,38 @@
+# Virtual environment
+.venv/
+env/
+venv/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Data & database files
+data/*.sqlite
+
+# Logs & outputs
+*.log
+*.txt
+!requirements.txt
+
+# Local test files
+tests/
+run_all_rounds.sh
+
+# System files
+.DS_Store
+.idea/
+.vscode/
+
+# Hugging Face build caches
+outputs/
+
+# (keep .env private)
+.env
+*.env
+.env.*
+uvicorn.log
+
+# Script files
+scripts/
+_test_stubs/

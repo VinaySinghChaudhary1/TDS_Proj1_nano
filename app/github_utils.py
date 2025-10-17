@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
-from app.settings import settings
+from .settings import settings
 
 logger = logging.getLogger(__name__)
 GITHUB_API = "https://api.github.com"
@@ -330,6 +330,51 @@ jobs:
         uses: actions/deploy-pages@v4
 """
     create_or_update_file(owner, repo, ".github/workflows/pages.yml", yaml_content, "add pages.yml")
+
+
+# ---------------------------------------------------------------------
+# High-level helper for worker
+# ---------------------------------------------------------------------
+def create_repo_and_push(generated: dict, repo_hint: str) -> Tuple[str, str, str]:
+    """
+    Combined utility used by worker.py.
+    Creates repo, pushes app_code, readme, license, and enables Pages.
+    """
+    owner = settings.GITHUB_OWNER
+    repo = f"{repo_hint}".replace(" ", "-").lower()
+    logger.info("Creating and pushing repo %s/%s", owner, repo)
+
+    repo_info = create_repo(repo, description="TDS auto-deployed app")
+    # app_code may be a string (monolithic index.html) or a mapping of filename -> content
+    app_code = generated.get("app_code")
+    if isinstance(app_code, dict):
+        # push each filename individually
+        for fname, content in app_code.items():
+            if isinstance(content, str):
+                logger.info("Pushing file %s to repo %s/%s", fname, owner, repo)
+                create_or_update_file(owner, repo, fname, content, f"add {fname}")
+            elif isinstance(content, (bytes, bytearray)):
+                logger.info("Pushing binary file %s to repo %s/%s", fname, owner, repo)
+                create_or_update_binary_file(owner, repo, fname, bytes(content), f"add {fname}")
+            else:
+                # Fallback: convert to string
+                logger.info("Pushing file %s (converted to text) to repo %s/%s", fname, owner, repo)
+                create_or_update_file(owner, repo, fname, str(content), f"add {fname}")
+        # ensure index.html exists or set pages to first HTML file
+        if "index.html" not in app_code:
+            # no explicit index; nothing to do here, Pages enable will look for index.html
+            logger.debug("No index.html present in generated app_code; proceeding without explicit index.html")
+    else:
+        # assume app_code is a single string to be written as index.html
+        create_or_update_file(owner, repo, "index.html", str(app_code or ""), "add app_code")
+
+    create_or_update_file(owner, repo, "README.md", generated.get("readme", ""), "add readme")
+    create_or_update_file(owner, repo, "LICENSE", generated.get("license", ""), "add license")
+
+    pages_url, _ = enable_pages_and_wait(owner, repo)
+    commit_sha = repo_info.get("pushed_at", str(time.time()))
+    return f"https://github.com/{owner}/{repo}", commit_sha, pages_url
+
 
 
 # ---------------------------------------------------------------------

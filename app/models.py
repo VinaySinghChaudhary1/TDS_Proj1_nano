@@ -1,8 +1,7 @@
 # app/models.py
-from sqlmodel import SQLModel, Field
+from sqlmodel import SQLModel, Field, Column, Text
 from typing import Optional
 from datetime import datetime
-
 
 class TaskRecord(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)
@@ -10,18 +9,17 @@ class TaskRecord(SQLModel, table=True):
     task: str
     round: int
     nonce: str
-    brief: Optional[str] = None
-    checks: Optional[str] = None       # JSON string
-    evaluation_url: Optional[str] = None
-    attachments: Optional[str] = None  # JSON string or comma-separated
-    status: str = "queued"
+    brief: str = Field(default="", sa_column=Column(Text))  # ✅ added
+    checks: str = Field(default="[]", sa_column=Column(Text))
+    evaluation_url: str = Field(default="", sa_column=Column(Text))
+    attachments: str = Field(default="[]", sa_column=Column(Text))
+    status: str = Field(default="queued")
     repo_name: Optional[str] = None
     commit_sha: Optional[str] = None
     pages_url: Optional[str] = None
+    attempts: int = Field(default=0)
     received_at: datetime = Field(default_factory=datetime.utcnow)
     completed_at: Optional[datetime] = None
-    attempts: int = 0
-
 
 class RepoRecord(SQLModel, table=True):
     id: Optional[int] = Field(default=None, primary_key=True)

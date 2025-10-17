@@ -1,353 +1,362 @@
-"""
-Background worker to process a single task.
-Functions:
- - process_task(task_id) : loads TaskRecord from DB and runs the pipeline.
-"""
 
-import base64
-import json
-import logging
+"""Upgraded worker.py
+- Implements process_task(task_id) which:
+  * loads a TaskRecord from DB (flexible to dict fallback)
+  * runs three isolated stages: generate -> repo push -> notify
+  * each stage has independent retries and logging
+  * updates DB status fields where available
+"""
 import time
-from typing import Optional
-from datetime import datetime
-import requests
+import logging
+from typing import Optional, Tuple, Dict, Any
 
-from .db import get_session
-from . import models
-from .llm_generator import generate_manifest
-from .github_utils import (
-    create_repo,
-    create_or_update_file,
-    create_or_update_binary_file,
-    generate_mit_license,
-    enable_pages_and_wait,
-    _get_file_sha,
-    GITHUB_API,
-    _headers,
-)
-from .settings import settings
-
-logger = logging.getLogger(__name__)
-
-
-# -----------------------------------------------------------
-# Helper: Extract selector for lightweight manifest validation
-# -----------------------------------------------------------
-def _simple_selector_from_check(check: str) -> Optional[str]:
-    import re
-    m = re.search(r"querySelector(All)?\(['\"](.+?)['\"]\)", check)
-    if m:
-        return m.group(2)
-    m2 = re.search(r"getElementById\(['\"](.+?)['\"]\)", check)
-    if m2:
-        return f"#{m2.group(1)}"
-    return None
-
-
-# -----------------------------------------------------------
-# Helper: Lightweight manifest validation
-# -----------------------------------------------------------
-def _validate_manifest_basic(manifest: dict, checks: list) -> (bool, str):
-    # Build a list of candidate HTML contents to search (index.html first, then any other .html/.htm)
-    files = manifest.get("files", [])
-    html_candidates = []
-    # prefer index.html/index.htm first
-    for name in ("index.html", "index.htm"):
-        for f in files:
-            if f.get("path", "").lower() == name:
-                html_candidates.append((name, f.get("content", "")))
-                break
-
-    # add any other HTML files
-    for f in files:
-        path = f.get("path", "")
-        if path.lower().endswith('.html') or path.lower().endswith('.htm'):
-            if not any(path.lower() == p.lower() for p, _ in html_candidates):
-                html_candidates.append((path, f.get("content", "")))
-
-    if not html_candidates:
-        return False, "no HTML files found in manifest"
-
-    # Parse all candidate HTML with BeautifulSoup where possible
-    soups = []
-    from bs4 import BeautifulSoup
-    for path, content in html_candidates:
-        try:
-            soups.append((path, BeautifulSoup(content, "html.parser"), content))
-        except Exception:
-            soups.append((path, None, content))
-
-    for check in checks:
-        selector = _simple_selector_from_check(check)
-        if not selector:
-            continue
-        found = False
-        for path, soup, raw in soups:
-            if soup:
-                try:
-                    res = soup.select(selector)
-                    if res:
-                        found = True
-                        break
-                except Exception:
-                    pass
-            # fallback: plain string search in raw content
-            if selector in raw:
-                found = True
-                break
-        if not found:
-            return False, f"Selector {selector} from check not found in any HTML file (checked {', '.join(p for p,_,_ in soups)})"
-    return True, "basic checks passed"
-
-
-# -----------------------------------------------------------
-# Upload attachments (improved downloader)
-# -----------------------------------------------------------
-def _push_attachments(owner: str, repo: str, attachments: list):
-    """Push attachment files (binary or text) to GitHub repo with retries + fallback."""
-    if not attachments:
-        return
-    for a in attachments:
-        name = a.get("name")
-        url = a.get("url")
-        if not name or not url:
-            continue
-        try:
-            logger.info("📎 Uploading attachment: %s", name)
-            binary_data = b""
-            if url.startswith("data:"):
-                base64_data = url.split("base64,")[-1]
-                binary_data = base64.b64decode(base64_data + "==", validate=False)
-            else:
-                headers = {"User-Agent": "Mozilla/5.0"}
-                for attempt in range(2):
-                    try:
-                        r = requests.get(url, headers=headers, timeout=20)
-                        r.raise_for_status()
-                        binary_data = r.content
-                        break
-                    except Exception as e:
-                        logger.warning("⚠️ Attempt %s failed for %s: %s", attempt + 1, name, e)
-                        time.sleep(1)
-                if not binary_data:
-                    logger.warning("⚠️ Using placeholder for %s (download failed).", name)
-                    binary_data = b""
-
-            create_or_update_binary_file(owner, repo, name, binary_data, f"add attachment {name}")
-            logger.info("✅ Uploaded attachment: %s", name)
-        except Exception as e:
-            logger.warning("⚠️ Failed to upload attachment %s: %s", name, e)
-
-
-# -----------------------------------------------------------
-# Helper: Push manifest files to GitHub
-# -----------------------------------------------------------
-def _push_manifest_to_github(manifest: dict, repo_name: str, commit_msg_prefix: str = "tds: generate") -> str:
-    owner = settings.GITHUB_OWNER
-    last_commit_sha = None
-
-    logger.info("Ensuring repo exists: %s/%s", owner, repo_name)
-    create_repo(repo_name, description="TDS generated repo", private=False)
-
-    for f in manifest.get("files", []):
-        path = f["path"]
-        content = f.get("content", "")
-        encoding = f.get("encoding", "utf-8")
-        commit_msg = f"{commit_msg_prefix}: {path}"
-        try:
-            if encoding and encoding.lower() == "base64":
-                raw = base64.b64decode(content)
-                resp = create_or_update_binary_file(owner, repo_name, path, raw, commit_msg)
-            else:
-                resp = create_or_update_file(owner, repo_name, path, content, commit_msg)
-            last_commit_sha = resp.get("commit", {}).get("sha") or last_commit_sha
-        except Exception as exc:
-            logger.exception("Failed to push file %s: %s", path, exc)
-            raise
-
+# Attempt to import project-specific modules; fall back gracefully
+try:
+    from .db import get_session, update_task_status, get_task_by_id
+    from . import models
+except Exception:
+    # If project modules are not available as package imports, try relative
     try:
-        logger.info("Adding MIT license to repository...")
-        license_text = generate_mit_license()
-        resp = create_or_update_file(owner, repo_name, "LICENSE", license_text, "chore: add MIT license")
-        last_commit_sha = resp.get("commit", {}).get("sha") or last_commit_sha
-        logger.info("✅ Successfully added LICENSE file")
-    except Exception as exc:
-        logger.warning("Failed to add LICENSE (non-critical): %s", str(exc))
+        from db import get_session, update_task_status, get_task_by_id
+        import models
+    except Exception:
+        get_session = None
+        update_task_status = None
+        get_task_by_id = None
+        models = None
 
-    return last_commit_sha or ""
+# LLM and GitHub utilities
+try:
+    from .llm_generator import generate_app_from_brief, _validate_json_schema
+except Exception:
+    from llm_generator import generate_app_from_brief, _validate_json_schema
 
+# GitHub helper functions - expected implementations in your repo. We will call
+# create_repo_and_push(response, repo_name_hint) and it should return (repo_url, commit_sha, pages_url)
+try:
+    from .github_utils import create_repo_and_push
+except Exception:
+    create_repo_and_push = None  # will raise if not found
 
-# -----------------------------------------------------------
-# README.md updater (enhanced for full round details + note)
-# -----------------------------------------------------------
-def _update_readme(owner, repo_name, task, round_num, brief, checks, pages_url):
-    """Create or append README.md with full round summaries for every round."""
-    date_str = datetime.utcnow().strftime("%Y-%m-%d")
-    sha = _get_file_sha(owner, repo_name, "README.md")
+import json, requests, os, base64, mimetypes
+from pathlib import Path
+from datetime import datetime
 
-    render_note = ""
-    if round_num >= 2:
-        render_note = "\n> ⏳ **Note:** GitHub Pages may take around 10 minutes to fully render and reflect all updates for this round.\n"
+def _safe_post(url: str, payload: Dict[str, Any], retries: int = 4, timeout: int = 15) -> bool:
+    """Post JSON payload with exponential backoff.
 
-    checks_section = "\n".join([f"- {c}" for c in checks or []])
-    round_block = f"""
-## {'🌀 Round 1' if round_num == 1 else f'🔁 Round {round_num} Update'} ({date_str})
-
-**Brief:** {brief}
-
-**Checks:**
-{checks_section}
-
-**Status:** ✅ {'Completed' if round_num == 1 else 'Redeployed'}
-
-**Pages URL:** [{pages_url}]({pages_url})
-{render_note}
----
-"""
-
-    header = f"# {task} — Task Report\n\n**GitHub Pages:** [View Site]({pages_url})\n\n---\n"
-
-    if sha:
-        # Read the current README
-        url = f"{GITHUB_API}/repos/{owner}/{repo_name}/contents/README.md"
-        r = requests.get(url, headers=_headers())
-        current = ""
-        if r.status_code == 200:
-            import base64
-            current = base64.b64decode(r.json()["content"]).decode("utf-8")
-
-        new_content = current + "\n" + round_block
-    else:
-        new_content = header + round_block
-
-    create_or_update_file(owner, repo_name, "README.md", new_content, f"update README for round {round_num}")
-
-
-# -----------------------------------------------------------
-# Notify evaluation endpoint
-# -----------------------------------------------------------
-def _notify_evaluation(evaluation_url: str, payload: dict, max_attempts: int = 6):
-    if not evaluation_url:
-        logger.warning("No evaluation_url provided; skipping notify")
-        return False
-    headers = {"Content-Type": "application/json"}
-    attempt = 0
-    wait = 1
-    while attempt < max_attempts:
+    Returns True on success (status 200). Returns False after retries fail.
+    Retries are attempted silently (logged at debug); final failure returns False
+    instead of raising an exception to avoid crashing the worker.
+    """
+    for attempt in range(1, retries + 1):
         try:
-            r = requests.post(evaluation_url, json=payload, headers=headers, timeout=10)
-            logger.info("Notify attempt %s -> status %s", attempt + 1, r.status_code)
-            if 200 <= r.status_code < 300:
+            r = requests.post(url, json=payload, timeout=timeout)
+            if r.status_code == 200:
                 return True
-        except Exception as exc:
-            logger.warning("Notify attempt %s failed: %s", attempt + 1, exc)
-        attempt += 1
-        time.sleep(wait)
-        wait *= 2
-    logger.error("All notify attempts failed for %s", evaluation_url)
+            logging.debug("POST to %s returned %s (attempt %s)", url, r.status_code, attempt)
+        except Exception as e:
+            logging.debug("POST to %s failed on attempt %s: %s", url, attempt, e)
+        time.sleep(2 ** (attempt - 1))
+    logging.error("Failed to POST to %s after %s attempts", url, retries)
     return False
 
 
-# -----------------------------------------------------------
-# MAIN WORKER FUNCTION
-# -----------------------------------------------------------
-def process_task(task_id: int):
-    logger.info("Processing task id=%s", task_id)
-    with next(get_session()) as session:
-        task = session.get(models.TaskRecord, task_id)
-        if not task:
-            logger.error("Task id %s not found", task_id)
-            return False
+def _update_db_status(task_obj, status: str, extra: Optional[Dict[str, Any]] = None):
+    """Helper to update task status in DB or in-memory object."""
+    try:
+        if update_task_status and task_obj is not None:
+            update_task_status(task_obj.get('id') if isinstance(task_obj, dict) else task_obj.id, status, extra or {})
+        else:
+            # If no DB helper exists, try to set attribute on object (best-effort)
+            if isinstance(task_obj, dict):
+                task_obj['status'] = status
+            else:
+                setattr(task_obj, 'status', status)
+    except Exception as e:
+        logging.debug("Could not update DB status: %s", e)
 
-        task.status = "processing"
-        session.add(task)
-        session.commit()
 
+def _ensure_logs_dir() -> Path:
+    p = Path('logs')
+    try:
+        p.mkdir(parents=True, exist_ok=True)
+    except Exception:
+        # best-effort
+        pass
+    return p
+
+
+def _task_log(task_obj, message: str):
+    """Append a timestamped message to the global tasks log and per-task log file."""
+    try:
+        task_id = task_obj.get('id') if isinstance(task_obj, dict) else getattr(task_obj, 'id', 'unknown')
+        ts = datetime.utcnow().strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]
+        line = f"{ts} - task:{task_id} - {message}\n"
+        logs_dir = _ensure_logs_dir()
+        # append to global log
         try:
-            checks = json.loads(task.checks) if task.checks else []
+            with open(logs_dir / 'tasks.log', 'a', encoding='utf-8') as fh:
+                fh.write(line)
         except Exception:
-            checks = task.checks or []
-
-        brief_with_seed = (task.brief or "").replace("${seed}", task.nonce)
-        checks_with_seed = [c.replace("${seed}", task.nonce) if isinstance(c, str) else c for c in checks]
-
-        logger.info("Replaced ${seed} with nonce '%s' in brief and checks", task.nonce)
-
+            logging.debug('Could not write to logs/tasks.log')
+        # append to per-task log
         try:
-            attachments = json.loads(task.attachments or "[]")
+            with open(logs_dir / f'task_{task_id}.log', 'a', encoding='utf-8') as fh:
+                fh.write(line)
         except Exception:
-            attachments = []
+            logging.debug('Could not write to per-task log for %s', task_id)
+    except Exception as e:
+        logging.debug('Failed to write task log: %s', e)
 
+
+def _stage_generate(task_brief: str, max_attempts: int = 3) -> Dict[str, Any]:
+    """Stage 1: call LLM and validate output"""
+    last_err = None
+    for attempt in range(1, max_attempts + 1):
         try:
-            manifest = generate_manifest(
-                brief_with_seed, checks_with_seed, attachments=attachments, nonce=task.nonce, round_num=task.round
-            )
-        except Exception as exc:
-            logger.exception("LLM manifest generation failed for task %s: %s", task_id, exc)
-            task.status = "failed"
-            session.add(task)
-            session.commit()
-            return False
+            generated = generate_app_from_brief(task_brief, max_attempts=1)
+            if _validate_json_schema(generated):
+                return generated
+            else:
+                last_err = RuntimeError("Generated payload failed schema validation")
+                logging.warning("Stage generate: invalid schema, attempt %s", attempt)
+        except Exception as e:
+            last_err = e
+            logging.warning("Stage generate attempt %s failed: %s", attempt, e)
+        time.sleep(2 ** (attempt - 1))
+    raise last_err or RuntimeError("LLM generation stage failed")
 
-        ok, msg = _validate_manifest_basic(manifest, checks_with_seed)
-        if not ok:
-            logger.error("Manifest validation failed: %s", msg)
-            task.status = "failed"
-            session.add(task)
-            session.commit()
-            return False
 
-        safe_task = task.task.replace(" ", "-").lower()
-        repo_name = f"{safe_task}-{task.nonce}"
-        task.repo_name = repo_name
-        session.add(task)
-        session.commit()
+def _download_with_retries(url: str, name: str, attempts: int = 3, timeout: int = 20):
+    """Download a URL (http(s) or data:) with simple retries.
 
+    Returns (content_bytes, content_type) or (None, None) on failure.
+    """
+    # data: URI handling
+    if url.startswith('data:'):
         try:
-            commit_sha = _push_manifest_to_github(manifest, repo_name)
-            _push_attachments(settings.GITHUB_OWNER, repo_name, attachments)
-            task.commit_sha = commit_sha
-            session.add(task)
-            session.commit()
-        except Exception as exc:
-            logger.exception("Failed to push manifest or attachments for task %s: %s", path, exc)
-            task.status = "failed"
-            session.add(task)
-            session.commit()
-            return False
+            # format: data:[<mediatype>][;base64],<data>
+            header, b64 = url.split(',', 1)
+            is_base64 = header.endswith(';base64')
+            ctype = header[5:].split(';')[0] if header.startswith('data:') else 'application/octet-stream'
+            if is_base64:
+                content = base64.b64decode(b64)
+            else:
+                content = b64.encode('utf-8')
+            return content, ctype or None
+        except Exception as e:
+            logging.warning("Failed to decode data URI for %s: %s", name, e)
+            return None, None
 
+    last_err = None
+    for attempt in range(1, attempts + 1):
         try:
-            pages_url, _ = enable_pages_and_wait(settings.GITHUB_OWNER, repo_name, branch="main", path="/", timeout=180)
-            task.pages_url = pages_url
-            session.add(task)
-            session.commit()
-        except Exception as exc:
-            logger.exception("Failed enabling pages for %s: %s", repo_name, exc)
-            task.status = "failed"
-            session.add(task)
-            session.commit()
-            return False
+            r = requests.get(url, stream=True, timeout=timeout)
+            r.raise_for_status()
+            content_type = r.headers.get('content-type')
+            # read all content into memory (acceptable for small attachments)
+            content = r.content
+            return content, content_type
+        except Exception as e:
+            last_err = e
+            logging.warning("Attempt %s failed downloading %s: %s", attempt, name, e)
+            time.sleep(2 ** (attempt - 1))
+    logging.warning("Download/decoding failed for %s", name)
+    return None, None
 
+
+def _process_attachments(task_obj: Dict[str, Any], generated: Dict[str, Any]) -> Dict[str, Any]:
+    """Download attachments from task_obj['attachments'] and merge into generated['app_code'].
+
+    - If generated['app_code'] is a string, convert it to a filename mapping with index.html.
+    - Attachments with text-like content types (json, csv, text, html, md) will be stored as strings.
+    - Binary attachments will be kept as bytes so the github helper can push binary files.
+    Returns the updated generated dict.
+    """
+    attachments = []
+    if isinstance(task_obj, dict):
+        attachments = task_obj.get('attachments') or []
+
+    if not attachments:
+        return generated
+
+    app_code = generated.get('app_code')
+    if not isinstance(app_code, dict):
+        # convert to dict, preserve original as index.html
+        app_code = { 'index.html': str(app_code or '') }
+
+    for att in attachments:
         try:
-            _update_readme(settings.GITHUB_OWNER, repo_name, task.task, task.round, task.brief, checks, task.pages_url)
-        except Exception as exc:
-            logger.warning("Failed to update README for %s: %s", repo_name, exc)
+            name = att.get('name') or att.get('filename')
+            url = att.get('url')
+            if not name or not url:
+                logging.debug('Skipping malformed attachment: %s', att)
+                continue
 
-        payload = {
-            "email": task.email,
-            "task": task.task,
-            "round": task.round,
-            "nonce": task.nonce,
-            "repo_url": f"https://github.com/{settings.GITHUB_OWNER}/{repo_name}",
-            "commit_sha": task.commit_sha,
-            "pages_url": task.pages_url,
-        }
-        notified = _notify_evaluation(task.evaluation_url or "", payload)
+            _task_log(task_obj, f"📎 Uploading attachment: {name}")
+            content, ctype = _download_with_retries(url, name, attempts=3)
+            if content is None:
+                # fallback: write a small placeholder text file
+                placeholder = f"Attachment {name} could not be downloaded."
+                app_code[name] = placeholder
+                _task_log(task_obj, f"⚠️ Placeholder used for attachment: {name}")
+                continue
 
-        task.status = "done" if notified else "done_notify_failed"
-        task.completed_at = datetime.utcnow()
-        session.add(task)
-        session.commit()
+            # decide binary or text
+            is_text = False
+            if ctype:
+                ctype_low = ctype.split(';')[0].lower()
+                if ctype_low.startswith('text/') or ctype_low in ('application/json', 'application/javascript'):
+                    is_text = True
+            # fallback: infer from extension
+            if not is_text:
+                ext = os.path.splitext(name)[1].lower()
+                if ext in ('.txt', '.md', '.html', '.csv', '.json', '.js'):
+                    is_text = True
 
-        logger.info("✅ Finished processing task id=%s round=%s", task_id, task.round)
-        return True
+            if is_text:
+                try:
+                    text = content.decode('utf-8')
+                except Exception:
+                    text = content.decode('latin-1', errors='ignore')
+                app_code[name] = text
+            else:
+                app_code[name] = content  # bytes
+
+            _task_log(task_obj, f"✅ Uploaded attachment: {name}")
+        except Exception as e:
+            logging.warning('Failed processing attachment %s: %s', att, e)
+            _task_log(task_obj, f"⚠️ Attachment failed: {att.get('name')} error={e}")
+
+    generated['app_code'] = app_code
+    return generated
+
+
+def _stage_repo_push(generated_payload: Dict[str, Any], repo_hint: Optional[str] = None) -> Tuple[str, str, str]:
+    """Stage 2: create repo and push files. Wrapped with retries for network/GitHub errors."""
+    if create_repo_and_push is None:
+        raise RuntimeError("create_repo_and_push is not implemented in github_utils")
+
+
+    last_err = None
+    for attempt in range(1, 5):
+        try:
+            repo_url, commit_sha, pages_url = create_repo_and_push(generated_payload, repo_hint)
+            if repo_url and commit_sha and pages_url:
+                return repo_url, commit_sha, pages_url
+            else:
+                last_err = RuntimeError("github_utils returned incomplete values")
+                logging.warning("Repo push returned incomplete values, attempt %s", attempt)
+        except Exception as e:
+            last_err = e
+            logging.warning("Repo push attempt %s failed: %s", attempt, e)
+        time.sleep(2 ** (attempt - 1))
+    raise last_err or RuntimeError("Repo push stage failed")
+
+
+def _stage_notify_eval(task_obj: Any, repo_url: str, commit_sha: str, pages_url: str, evaluation_url: str) -> bool:
+    """Stage 3: POST metadata to evaluation_url with retries.
+
+    Returns True on success, False on failure (after retries).
+    """
+    payload = {
+        "email": getattr(task_obj, 'email', task_obj.get('email') if isinstance(task_obj, dict) else None),
+        "task": getattr(task_obj, 'task', task_obj.get('task') if isinstance(task_obj, dict) else None),
+        "round": getattr(task_obj, 'round', task_obj.get('round') if isinstance(task_obj, dict) else None),
+        "nonce": getattr(task_obj, 'nonce', task_obj.get('nonce') if isinstance(task_obj, dict) else None),
+        "repo_url": repo_url,
+        "commit_sha": commit_sha,
+        "pages_url": pages_url,
+    }
+    ok = _safe_post(evaluation_url, payload, retries=5)
+    if not ok:
+        logging.warning("Notification to evaluation_url failed after retries: %s", evaluation_url)
+    return ok
+
+
+def process_task(task_identifier):
+    """Main entry point: accepts either a numeric task id or a dict-like task object.
+    This function performs all stages and updates DB state.
+    """
+    logging.info("Starting process_task for %s", task_identifier)
+    # Load task from DB if ID provided
+    task_obj = None
+    if isinstance(task_identifier, (int, str)):
+        if get_task_by_id:
+            try:
+                task_obj = get_task_by_id(task_identifier)
+            except Exception as e:
+                logging.warning("Could not fetch task from DB: %s", e)
+                task_obj = {'id': task_identifier}
+        else:
+            task_obj = {'id': task_identifier}
+    elif isinstance(task_identifier, dict):
+        task_obj = task_identifier
+    else:
+        task_obj = task_identifier
+
+    _update_db_status(task_obj, 'processing')
+    _task_log(task_obj, f"Accepted task {task_identifier}")
+    _task_log(task_obj, 'status=processing')
+
+    try:
+        brief = getattr(task_obj, 'brief', task_obj.get('brief') if isinstance(task_obj, dict) else None)
+        if not brief:
+            raise ValueError('Task brief missing')
+
+        # 1. Generate app using LLM with isolated retries
+        logging.info('Stage 1: LLM generate')
+        _task_log(task_obj, 'stage=generate:start')
+        generated = _stage_generate(brief, max_attempts=3)
+        _update_db_status(task_obj, 'generated', {'meta': 'llm_ok'})
+        _task_log(task_obj, 'stage=generate:ok')
+
+        # Process attachments (download and merge into app_code)
+        generated = _process_attachments(task_obj, generated)
+
+        # 2. Push to GitHub (repo creation & pages) - independent retries
+        logging.info('Stage 2: Repo push')
+        _task_log(task_obj, 'stage=repo_push:start')
+        repo_hint = getattr(task_obj, 'task', None) or getattr(task_obj, 'id', None) or 'tds-task'
+        repo_url, commit_sha, pages_url = _stage_repo_push(generated, repo_hint)
+        _update_db_status(task_obj, 'pushed', {'repo_url': repo_url, 'commit_sha': commit_sha, 'pages_url': pages_url})
+        _task_log(task_obj, f'stage=repo_push:ok repo={repo_url} commit={commit_sha} pages={pages_url}')
+
+        # 3. Notify evaluation URL
+        logging.info('Stage 3: Notify evaluator')
+        _task_log(task_obj, 'stage=notify:start')
+        evaluation_url = getattr(task_obj, 'evaluation_url', task_obj.get('evaluation_url') if isinstance(task_obj, dict) else None)
+        if not evaluation_url:
+            logging.warning('No evaluation_url provided; skipping notify stage')
+            _task_log(task_obj, 'stage=notify:skipped')
+        else:
+            notified = _stage_notify_eval(task_obj, repo_url, commit_sha, pages_url, evaluation_url)
+            if notified:
+                _update_db_status(task_obj, 'notified', {'notified_to': evaluation_url})
+            else:
+                # Mark notify failed but continue; do not raise
+                _update_db_status(task_obj, 'notify_failed', {'notified_to': evaluation_url})
+                _task_log(task_obj, 'stage=notify:failed')
+
+        _update_db_status(task_obj, 'done', {'repo_url': repo_url, 'pages_url': pages_url})
+        _task_log(task_obj, 'status=done')
+        logging.info('Task %s completed successfully', getattr(task_obj, 'id', None))
+
+    except Exception as e:
+        # Log exception and update task state, but do not re-raise to avoid crashing
+        # the ASGI background worker thread. The task will be marked as failed
+        # and the server can continue handling requests.
+        logging.exception('Task processing failed: %s', e)
+        _update_db_status(task_obj, 'failed', {'error': str(e)})
+        _task_log(task_obj, f'status=failed error={e}')
+        # Do not re-raise to keep background thread stable. Caller expects fire-and-forget.
+        return
+
+if __name__ == '__main__':
+    # Quick smoke test (non-network)
+    fake_task = {'id': 'local-test-1', 'brief': 'Create a single page app that shows Hello World', 'email': 'test@example.com', 'task': 'local-test', 'round': 1, 'nonce': 'abc'}
+    try:
+        process_task(fake_task)
+    except Exception as e:
+        print('Process task test failed (expected if GitHub utilities not implemented):', e)

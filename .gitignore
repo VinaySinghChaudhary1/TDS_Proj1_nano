@@ -36,3 +36,5 @@ uvicorn.log
 # Script files
 scripts/
 _test_stubs/
+
+app/__pycache__

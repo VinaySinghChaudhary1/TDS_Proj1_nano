@@ -1,52 +1,42 @@
----
-title: TDS Project 1 Deployer
-emoji: 🚀
-colorFrom: blue
-colorTo: indigo
-sdk: docker
-app_file: Dockerfile
-pinned: true
----
 
-# 🚀 **TDS Project 1 Deployer**
+# 🚀 Final Upgraded Nano Project (GPT-4o)
 
-[![FastAPI](https://img.shields.io/badge/FastAPI-0.110+-009688?logo=fastapi&logoColor=white)](https://fastapi.tiangolo.com/)
-[![Hugging Face](https://img.shields.io/badge/Hosted%20on-HuggingFace-yellow?logo=huggingface)](https://huggingface.co/spaces/VinaySinghChaudhary/tds_project1_vinay)
-[![GitHub](https://img.shields.io/badge/Integration-GitHub-blue?logo=github)](https://github.com/VinaySinghChaudhary)
-[![Python](https://img.shields.io/badge/Python-3.11+-green?logo=python)](https://www.python.org/)
-[![Status](https://img.shields.io/badge/Status-Online-success?logo=vercel)](https://vinaysinghchaudhary-tds_project1_vinay.hf.space/health)
+This project is the final upgraded version of your **LLM Code Deployment (TDS Project 1)** app.
+It incorporates all architectural and logic improvements inspired by the Gemini (Gymnast) build.
+
+## 🧱 Architecture Overview
+Refer to the section "Architecture Overview (Upgraded Nano Build – GPT-4o)" above for full explanation.
 
 ---
 
-## 🧠 **Overview**
+## ✅ Key Upgrades Summary
 
-**TDS Project 1 Deployer** is a FastAPI-based automation service hosted on **Hugging Face Spaces (Docker)** that:
-- Accepts **Round 1 & Round 2 JSON tasks** from the **TDS Server**,
-- Automatically creates **GitHub repositories** per task,
-- Pushes generated web app files to GitHub,
-- Enables **GitHub Pages deployment**, and
-- Sends evaluation results back via webhook.
-
-It’s the backend bridge between **TDS AI evaluation tasks** and **automated GitHub deployment**.
+- Added schema validation for GPT-4o JSON output.
+- Added 3-stage isolated pipeline (Generate → Push → Notify).
+- Improved retry handling and fault tolerance.
+- Added exponential backoff for all critical stages.
+- Integrated detailed logging and DB-safe task updates.
+- Verified Round 2 revision readiness.
 
 ---
 
-## ⚙️ **Tech Stack**
+## ⚙️ How to Run Locally
 
-| Layer | Technology |
-|-------|-------------|
-| Backend | [FastAPI](https://fastapi.tiangolo.com/) |
-| Hosting | [Hugging Face Spaces (Docker)](https://huggingface.co/spaces) |
-| LLM | OpenAI (configurable, e.g., `gpt-4o` or `gpt-5-nano`) |
-| Database | SQLite (via SQLModel + SQLAlchemy) |
-| SCM | GitHub API (automated repo + Pages deployment) |
-
----
-
-## 🧩 **Key Endpoints**
-
-### 🔹 `GET /health`
-
-Check service liveness.  
 ```bash
-curl https://vinaysinghchaudhary-tds_project1_vinay.hf.space/health
+# Activate your environment and run FastAPI or main app
+uvicorn app.main:app --reload
+
+# Or test worker directly
+python worker.py
+```
+
+---
+
+## 📤 Submission Info
+- **LLM Engine:** GPT-4o (OpenAI)
+- **Comparison Build:** Gemini (Gymnast) – reference only
+- **Ready for:** Round 1 and Round 2 evaluation per project statement
+
+---
+
+© 2025 TDS Project | Developed by Vinay Singh

@@ -15,6 +15,9 @@ from sqlmodel import SQLModel, create_engine, Session
 from .settings import settings
 from . import models  # ensure models are imported so SQLModel metadata includes them
 
+from typing import Optional
+from . import models
+
 logger = logging.getLogger(__name__)
 
 
@@ -71,6 +74,46 @@ def get_session():
     """
     with Session(engine) as session:
         yield session
+
+# ---------- convenience helpers for worker.py ----------
+def get_task_by_id(task_id: int) -> Optional[models.TaskRecord]:
+    """Return the TaskRecord instance for given id or None."""
+    with Session(engine) as session:
+        return session.get(models.TaskRecord, task_id)
+
+
+def update_task_status(task_id: int, status: str, extra: dict = None) -> Optional[models.TaskRecord]:
+    """
+    Update status (and optional extra fields) on TaskRecord.
+    Returns the updated TaskRecord.
+    """
+    extra = extra or {}
+    with Session(engine) as session:
+        task = session.get(models.TaskRecord, task_id)
+        if not task:
+            return None
+        task.status = status
+        # store extra fields if provided: repo_url/pages_url/error etc.
+        if 'repo_url' in extra:
+            task.repo_name = extra.get('repo_url')  # or parse repo name if needed
+        if 'pages_url' in extra:
+            task.pages_url = extra.get('pages_url')
+        if 'commit_sha' in extra:
+            task.commit_sha = extra.get('commit_sha')
+        if 'error' in extra:
+            # keep a simple last-error text field if you want
+            # optional: add an 'error' column to models if desired
+            pass
+        # increment attempts optionally
+        try:
+            task.attempts = (task.attempts or 0) + 1
+        except Exception:
+            task.attempts = 1
+        session.add(task)
+        session.commit()
+        session.refresh(task)
+        return task
+
 
 
 def init_db():

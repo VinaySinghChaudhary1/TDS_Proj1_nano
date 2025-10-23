@@ -145,6 +145,17 @@ async def receive_task(payload: TaskPayload, background_tasks: BackgroundTasks, 
 # -----------------------------------------------------------
 # 🧰 Dev endpoint: /api/tasks
 # -----------------------------------------------------------
+@app.post("/")
+async def root_post(payload: TaskPayload, background_tasks: BackgroundTasks, request: Request):
+    """Allow POSTs to the base URL to behave like POST /api/task.
+
+    This wrapper forwards the validated payload and BackgroundTasks to
+    the main `receive_task` handler so clients that mistakenly POST to the
+    base URL (for example as submitted in an evaluation form) still get the
+    expected behavior.
+    """
+    return await receive_task(payload, background_tasks, request)
+
 @app.get("/api/tasks")
 def list_tasks(limit: int = 50):
     """List recent tasks."""
